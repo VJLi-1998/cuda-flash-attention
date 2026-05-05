@@ -29,6 +29,8 @@ __global__ void flash_attn_fwd_kernel(
     static_assert(Bc <= 32, "Bc must be <= 32");
     static_assert(d <= 128, "d must be <= 128");
 
+    constexpr int D_STRIDE = d + 1;  // +1 pad avoids bank conflicts (d % 32 == 0)
+
     const int batch_idx  = blockIdx.z / H;
     const int head_idx   = blockIdx.z % H;
     const int q_block    = blockIdx.x;
@@ -47,22 +49,24 @@ __global__ void flash_attn_fwd_kernel(
     const int offset = batch_idx * H * N * d + head_idx * N * d;
 
     extern __shared__ float smem[];
-    float* s_Q = smem;                            // Br * d
-    float* s_K = smem + Br * d;                    // Bc * d
-    float* s_V = smem + Br * d + Bc * d;           // Bc * d
-    float* s_O = smem + Br * d + 2 * Bc * d;       // Br * d
+    float* s_Q = smem;                                              // Br * D_STRIDE
+    float* s_K = smem + Br * D_STRIDE;                              // Bc * D_STRIDE
+    float* s_V = smem + Br * D_STRIDE + Bc * D_STRIDE;              // Bc * D_STRIDE
+    float* s_O = smem + Br * D_STRIDE + 2 * Bc * D_STRIDE;          // Br * D_STRIDE
 
     // --- Cooperative load Q into shared memory ---
     for (int i = tid; i < Br * d; i += num_thread) {
         int row = i / d;
         int col = i % d;
         int n = q_start + row;
-        s_Q[i] = (n < N) ? __ldg(Q + offset + n * d + col) : 0.0f;
+        s_Q[row * D_STRIDE + col] = (n < N) ? __ldg(Q + offset + n * d + col) : 0.0f;
     }
 
     // --- Initialize s_O to zero ---
     for (int i = tid; i < Br * d; i += num_thread) {
-        s_O[i] = 0.0f;
+        int row = i / d;
+        int col = i % d;
+        s_O[row * D_STRIDE + col] = 0.0f;
     }
     __syncthreads();
 
@@ -81,14 +85,14 @@ __global__ void flash_attn_fwd_kernel(
             int row = i / d;
             int col = i % d;
             int n = kv_start + row;
-            s_K[i] = (n < N) ? __ldg(K + offset + n * d + col) : 0.0f;
+            s_K[row * D_STRIDE + col] = (n < N) ? __ldg(K + offset + n * d + col) : 0.0f;
         }
         // Cooperative load Vj into shared memory
         for (int i = tid; i < Bc * d; i += num_thread) {
             int row = i / d;
             int col = i % d;
             int n = kv_start + row;
-            s_V[i] = (n < N) ? __ldg(V + offset + n * d + col) : 0.0f;
+            s_V[row * D_STRIDE + col] = (n < N) ? __ldg(V + offset + n * d + col) : 0.0f;
         }
         __syncthreads();
 
@@ -101,7 +105,7 @@ __global__ void flash_attn_fwd_kernel(
                 float dot = 0.0f;
                 #pragma unroll
                 for (int k = 0; k < d; k++) {
-                    dot += s_Q[qi_row * d + k] * s_K[j * d + k];
+                    dot += s_Q[qi_row * D_STRIDE + k] * s_K[j * D_STRIDE + k];
                 }
                 m_tile = fmaxf(m_tile, dot * sm_scale);
             }
@@ -117,7 +121,7 @@ __global__ void flash_attn_fwd_kernel(
             float rescale = (l_i > 0.0f) ? expf(m_old - m_new) : 0.0f;
 
             for (int k = lane_id; k < d; k += WARP_SIZE) {
-                s_O[qi_row * d + k] *= rescale;
+                s_O[qi_row * D_STRIDE + k] *= rescale;
             }
             __syncwarp();
 
@@ -127,14 +131,14 @@ __global__ void flash_attn_fwd_kernel(
                 float dot = 0.0f;
                 #pragma unroll
                 for (int k = 0; k < d; k++) {
-                    dot += s_Q[qi_row * d + k] * s_K[j * d + k];
+                    dot += s_Q[qi_row * D_STRIDE + k] * s_K[j * D_STRIDE + k];
                 }
                 float s_val = dot * sm_scale;
                 float p = expf(s_val - m_new);
                 exp_sum += p;
 
                 for (int k = 0; k < d; k++) {
-                    atomicAdd(s_O + qi_row * d + k, p * s_V[j * d + k]);
+                    atomicAdd(s_O + qi_row * D_STRIDE + k, p * s_V[j * D_STRIDE + k]);
                 }
             }
 
@@ -156,7 +160,7 @@ __global__ void flash_attn_fwd_kernel(
     float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
     int n = q_start + qi_row;
     for (int k = lane_id; k < d; k += WARP_SIZE) {
-        O[offset + n * d + k] = s_O[qi_row * d + k] * inv_l;
+        O[offset + n * d + k] = s_O[qi_row * D_STRIDE + k] * inv_l;
     }
     if (lane_id == 0) {
         LSE[batch_idx * H * N + head_idx * N + n] = m_i + __logf(l_i);
@@ -210,6 +214,8 @@ __global__ void flash_attn_bwd_kernel(
     static_assert(Bc <= 32, "Bc must be <= 32");
     static_assert(d <= 128, "d must be <= 128");
 
+    constexpr int D_STRIDE = d + 1;  // +1 pad avoids bank conflicts
+
     const int batch_idx = blockIdx.z / H; //(batch, head)
     const int head_idx  = blockIdx.z % H;
     const int q_block   = blockIdx.x;
@@ -229,13 +235,13 @@ __global__ void flash_attn_bwd_kernel(
     const int lse_offset = batch_idx * H * N + head_idx * N;
 
     extern __shared__ float smem[];
-    float* s_Q  = smem;                                    // Br * d
-    float* s_dO = smem + Br * d;                            // Br * d
-    float* s_LSE = smem + 2 * Br * d;                        // Br
-    float* s_D  = smem + 2 * Br * d + Br;                    // Br
-    float* s_K  = smem + 2 * Br * d + 2 * Br;                // Bc * d
-    float* s_V  = smem + 2 * Br * d + 2 * Br + Bc * d;       // Bc * d
-    float* s_dQ = smem + 2 * Br * d + 2 * Br + 2 * Bc * d;   // Br * d
+    float* s_Q   = smem;                                                          // Br * D_STRIDE
+    float* s_dO  = smem + Br * D_STRIDE;                                          // Br * D_STRIDE
+    float* s_LSE = smem + 2 * Br * D_STRIDE;                                      // Br (scalars, no padding)
+    float* s_D   = smem + 2 * Br * D_STRIDE + Br;                                 // Br (scalars, no padding)
+    float* s_K   = smem + 2 * Br * D_STRIDE + 2 * Br;                             // Bc * D_STRIDE
+    float* s_V   = smem + 2 * Br * D_STRIDE + 2 * Br + Bc * D_STRIDE;             // Bc * D_STRIDE
+    float* s_dQ  = smem + 2 * Br * D_STRIDE + 2 * Br + 2 * Bc * D_STRIDE;         // Br * D_STRIDE
 
     // --- Cooperative load Qi, dOi into shared memory ---
     for (int i = tid; i < Br * d; i += num_thread) {
@@ -243,11 +249,11 @@ __global__ void flash_attn_bwd_kernel(
         int col = i % d;
         int n = q_start + row;
         if (n < N) {
-            s_Q[i]  = __ldg(Q + offset + n * d + col);
-            s_dO[i] = __ldg(dO + offset + n * d + col);
+            s_Q[row * D_STRIDE + col]  = __ldg(Q + offset + n * d + col);
+            s_dO[row * D_STRIDE + col] = __ldg(dO + offset + n * d + col);
         } else {
-            s_Q[i]  = 0.0f;
-            s_dO[i] = 0.0f;
+            s_Q[row * D_STRIDE + col]  = 0.0f;
+            s_dO[row * D_STRIDE + col] = 0.0f;
         }
     }
 
@@ -265,7 +271,9 @@ __global__ void flash_attn_bwd_kernel(
 
     // Initialize s_dQ to zero
     for (int i = tid; i < Br * d; i += num_thread) {
-        s_dQ[i] = 0.0f;
+        int row = i / d;
+        int col = i % d;
+        s_dQ[row * D_STRIDE + col] = 0.0f;
     }
     __syncthreads();
 
@@ -284,13 +292,13 @@ __global__ void flash_attn_bwd_kernel(
             int row = i / d;
             int col = i % d;
             int n = kv_start + row;
-            s_K[i] = (n < N) ? __ldg(K + offset + n * d + col) : 0.0f;
+            s_K[row * D_STRIDE + col] = (n < N) ? __ldg(K + offset + n * d + col) : 0.0f;
         }
         for (int i = tid; i < Bc * d; i += num_thread) {
             int row = i / d;
             int col = i % d;
             int n = kv_start + row;
-            s_V[i] = (n < N) ? __ldg(V + offset + n * d + col) : 0.0f;
+            s_V[row * D_STRIDE + col] = (n < N) ? __ldg(V + offset + n * d + col) : 0.0f;
         }
         __syncthreads();
 
@@ -303,7 +311,7 @@ __global__ void flash_attn_bwd_kernel(
                 float dot = 0.0f;
                 #pragma unroll
                 for (int k = 0; k < d; k++) {
-                    dot += s_Q[qi_row * d + k] * s_K[j * d + k];
+                    dot += s_Q[qi_row * D_STRIDE + k] * s_K[j * D_STRIDE + k];
                 }
                 float s_val = dot * sm_scale;
                 float p = expf(s_val - lse_i);
@@ -311,15 +319,15 @@ __global__ void flash_attn_bwd_kernel(
                 float dP_val = 0.0f;
                 #pragma unroll
                 for (int k = 0; k < d; k++) {
-                    dP_val += s_dO[qi_row * d + k] * s_V[j * d + k];
+                    dP_val += s_dO[qi_row * D_STRIDE + k] * s_V[j * D_STRIDE + k];
                 }
                 float dS = sm_scale * p * (dP_val - d_i);
 
                 int n_j = kv_start + j;
                 for (int k = 0; k < d; k++) {
-                    dQ_acc[k] += dS * s_K[j * d + k];
-                    atomicAdd(dV + offset + n_j * d + k, p * s_dO[qi_row * d + k]);
-                    atomicAdd(dK + offset + n_j * d + k, dS * s_Q[qi_row * d + k]);
+                    dQ_acc[k] += dS * s_K[j * D_STRIDE + k];
+                    atomicAdd(dV + offset + n_j * d + k, p * s_dO[qi_row * D_STRIDE + k]);
+                    atomicAdd(dK + offset + n_j * d + k, dS * s_Q[qi_row * D_STRIDE + k]);
                 }
             }
 
@@ -334,7 +342,7 @@ __global__ void flash_attn_bwd_kernel(
 
             // Write dQ to shared memory
             for (int k = lane_id; k < d; k += WARP_SIZE) {
-                s_dQ[qi_row * d + k] += dQ_acc[k];
+                s_dQ[qi_row * D_STRIDE + k] += dQ_acc[k];
             }
         }
 
@@ -345,7 +353,7 @@ __global__ void flash_attn_bwd_kernel(
     if (is_active) {
         int n = q_start + qi_row;
         for (int k = lane_id; k < d; k += WARP_SIZE) {
-            dQ[offset + n * d + k] = s_dQ[qi_row * d + k];
+            dQ[offset + n * d + k] = s_dQ[qi_row * D_STRIDE + k];
         }
     }
 }
@@ -353,23 +361,22 @@ __global__ void flash_attn_bwd_kernel(
 // ---------------------------------------------------------------------------
 // Host launch wrappers with template instantiation for d = 32, 64, 128
 //
-// Tile sizes chosen to fit shared memory <= 48KB per CTA:
-//   d=32:  Br=32 Bc=32  fwd: smem=(64+64)*32*4=16KB   bwd: (3072+2048+64)*4=20KB
-//   d=64:  Br=32 Bc=32  fwd: (64+64)*64*4=32KB         bwd: (6144+4096+64)*4=40KB
-//   d=128: Br=16 Bc=32  fwd: (32+64)*128*4=48KB        (forward only)
-//          Br=16 Bc=16  bwd: (6144+4096+32)*4=40KB     (backward)
+// D_STRIDE = d + 1 avoids shared-memory bank conflicts (d is always a
+// multiple of 32, so d%32==0 causes all threads in a warp to hit the
+// same bank when accessing s_K[j*d+k] and s_V[j*d+k]).
 // ---------------------------------------------------------------------------
 
-#define DISPATCH_FWD(Br, Bc, d_val)                                   \
-    case d_val: {                                                      \
-        int _n_blocks = (N + Br - 1) / Br;                             \
-        dim3 grid(_n_blocks, 1, B * H);                                \
-        dim3 block(Br * WARP_SIZE, 1, 1);                              \
-        int smem_bytes = (Br + 2 * Bc + Br) * d_val * sizeof(float);  \
-        flash_attn_fwd_kernel<Br, Bc, d_val>                           \
-            <<<grid, block, smem_bytes, stream>>>(                     \
-                Q, K, V, O, LSE, B, H, N, sm_scale);                  \
-        break;                                                         \
+#define DISPATCH_FWD(Br, Bc, d_val)                                         \
+    case d_val: {                                                            \
+        int _n_blocks = (N + Br - 1) / Br;                                   \
+        dim3 grid(_n_blocks, 1, B * H);                                      \
+        dim3 block(Br * WARP_SIZE, 1, 1);                                    \
+        constexpr int _d_s = d_val + 1;                                      \
+        int smem_bytes = (Br + 2 * Bc + Br) * _d_s * sizeof(float);         \
+        flash_attn_fwd_kernel<Br, Bc, d_val>                                 \
+            <<<grid, block, smem_bytes, stream>>>(                           \
+                Q, K, V, O, LSE, B, H, N, sm_scale);                        \
+        break;                                                               \
     }
 
 void flash_attn_forward(
@@ -391,16 +398,17 @@ void flash_attn_forward(
 
 // ---------------------------------------------------------------------------
 
-#define DISPATCH_BWD(Br, Bc, d_val)                                                    \
-    case d_val: {                                                                       \
-        int _n_blocks = (N + Br - 1) / Br;                                              \
-        dim3 grid(_n_blocks, 1, B * H);                                                  \
-        dim3 block(Br * WARP_SIZE, 1, 1);                                               \
-        int smem_bytes = (3 * Br * d_val + 2 * Bc * d_val + 2 * Br) * sizeof(float);   \
-        flash_attn_bwd_kernel<Br, Bc, d_val>                                            \
-            <<<grid, block, smem_bytes, stream>>>(                                      \
-                dO, Q, K, V, O, LSE, D, dQ, dK, dV, B, H, N, sm_scale);               \
-        break;                                                                          \
+#define DISPATCH_BWD(Br, Bc, d_val)                                                            \
+    case d_val: {                                                                               \
+        int _n_blocks = (N + Br - 1) / Br;                                                      \
+        dim3 grid(_n_blocks, 1, B * H);                                                          \
+        dim3 block(Br * WARP_SIZE, 1, 1);                                                       \
+        constexpr int _d_s = d_val + 1;                                                          \
+        int smem_bytes = (3 * Br * _d_s + 2 * Bc * _d_s + 2 * Br) * sizeof(float);             \
+        flash_attn_bwd_kernel<Br, Bc, d_val>                                                    \
+            <<<grid, block, smem_bytes, stream>>>(                                              \
+                dO, Q, K, V, O, LSE, D, dQ, dK, dV, B, H, N, sm_scale);                       \
+        break;                                                                                  \
     }
 
 void flash_attn_backward(
