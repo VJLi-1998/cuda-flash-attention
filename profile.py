@@ -1,16 +1,20 @@
 """
-Profile helper for FlashAttention kernel.
+Profile helper for FlashAttention-1 and FlashAttention-2 kernels.
+
 Run: python profile.py
 
-roofline 分析（算力/带宽利用率）：
+roofline analysis (compute / bandwidth utilisation):
 ncu --set full --launch-skip 10 --launch-count 1 python profile.py
-只看我们的 kernel（过滤掉 PyTorch 的）：
+
+Only profile our kernels (filter out PyTorch):
 ncu --kernel-name="flash_attn_fwd" --set full python profile.py
+ncu --kernel-name="flash_attn_fwd_v2" --set full python profile.py
+ncu --kernel-name="flash_attn_bwd_v2" --set full python profile.py
 """
 
 import torch
 import math
-from flash_attn import flash_attention
+from flash_attn import flash_attention, flash_attention_v2
 
 B, H, N, d = 1, 4, 512, 64
 sm_scale = 1.0 / math.sqrt(d)
@@ -22,20 +26,43 @@ V = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
 
 # Warmup
 for _ in range(3):
-    O = flash_attention(Q, K, V, sm_scale)
+    _ = flash_attention(Q, K, V, sm_scale)
+    _ = flash_attention_v2(Q, K, V, sm_scale)
 
-# Profile: forward
+# Profile FA1 forward
+print("Profiling FA1 forward...")
 torch.cuda.cudart().cudaProfilerStart()
-O = flash_attention(Q, K, V, sm_scale)
+O1 = flash_attention(Q, K, V, sm_scale)
 torch.cuda.cudart().cudaProfilerStop()
+print(f"  FA1 O shape: {O1.shape}")
 
-# Profile: forward + backward
-Q_g = Q.clone().requires_grad_()
-K_g = K.clone().requires_grad_()
-V_g = V.clone().requires_grad_()
+# Profile FA2 forward
+print("Profiling FA2 forward...")
 torch.cuda.cudart().cudaProfilerStart()
-O = flash_attention(Q_g, K_g, V_g, sm_scale)
-O.sum().backward()
+O2 = flash_attention_v2(Q, K, V, sm_scale)
 torch.cuda.cudart().cudaProfilerStop()
+print(f"  FA2 O shape: {O2.shape}")
 
-print(f"Done. O shape: {O.shape}")
+# Profile FA1 forward + backward
+print("Profiling FA1 forward + backward...")
+Q_g1 = Q.clone().requires_grad_()
+K_g1 = K.clone().requires_grad_()
+V_g1 = V.clone().requires_grad_()
+torch.cuda.cudart().cudaProfilerStart()
+O1 = flash_attention(Q_g1, K_g1, V_g1, sm_scale)
+O1.sum().backward()
+torch.cuda.cudart().cudaProfilerStop()
+print(f"  FA1 fwd+bwd done")
+
+# Profile FA2 forward + backward
+print("Profiling FA2 forward + backward...")
+Q_g2 = Q.clone().requires_grad_()
+K_g2 = K.clone().requires_grad_()
+V_g2 = V.clone().requires_grad_()
+torch.cuda.cudart().cudaProfilerStart()
+O2 = flash_attention_v2(Q_g2, K_g2, V_g2, sm_scale)
+O2.sum().backward()
+torch.cuda.cudart().cudaProfilerStop()
+print(f"  FA2 fwd+bwd done")
+
+print("Done.")
